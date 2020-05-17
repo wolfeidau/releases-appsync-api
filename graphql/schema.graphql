@@ -1,0 +1,41 @@
+schema {
+  subscription: Subscription
+  query: Query
+  mutation: Mutation
+}
+
+type Release {
+  id: ID!
+  gitHash: String!
+  author: String!
+  approver: String!
+  repoURL: AWSURL!
+  artifactURL: AWSURL!
+  created: AWSDateTime!
+}
+
+input CreateReleaseInput {
+  gitHash: String!
+  author: String!
+  approver: String!
+  repoURL: AWSURL!
+  artifactURL: AWSURL!
+}
+
+type ReleasePage {
+  items: [Release!]!,
+  nextToken: String
+}
+
+type Mutation {
+  createRelease(input: CreateReleaseInput!): Release
+}
+
+type Query {
+  findRelease(id: ID!): Release
+  findReleases(nextToken: String): ReleasePage
+}
+
+type Subscription {
+  newRelease: Release @aws_subscribe(mutations: ["createRelease"])
+}

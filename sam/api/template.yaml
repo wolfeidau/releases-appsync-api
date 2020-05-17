@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: The GraphQL release API, developed by @wolfeidau
+
+Parameters:
+  AppName:
+    Type: String
+    Description: The application name
+  Branch:
+    Type: String
+    Description: Git branch
+    Default: "master"
+  Stage:
+    Type: String
+    Description: Deployment stage
+    Default: 'dev'
+  RawEventLogging:
+    Type: String
+    Default: "false"
+
+Globals:
+  Function:
+    Runtime: go1.x
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        APP_NAME: !Ref AppName
+        BRANCH: !Ref Branch
+        STAGE: !Ref Stage
+        RAW_EVENT_LOGGING: !Ref RawEventLogging
+
+Resources:
+
+  ReleaseTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: expiry
+        Enabled: true
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  ReleasesGraphQLAPIFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: '../../dist/handler.zip'
+      Handler: lambda-api
+      Environment:
+        Variables:
+          - RELEASE_TABLE: !Ref ReleaseTable
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:*
+              Resource:
+                - !GetAtt ReleaseTable.Arn
+
+  ReleasesAppSyncLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/appsync/apis/${ReleasesGraphQLApi.ApiId}"
+
+  AppSyncServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "appsync.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+          - Effect: "Allow"
+            Action:
+              - "lambda:*"
+            Resource:
+              - "*"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+
+  ReleasesGraphQLApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub "ReleasesGraphQLApi-${Stage}-${Branch}"
+      AuthenticationType: AWS_IAM
+      LogConfig:
+        CloudWatchLogsRoleArn: !GetAtt AppSyncServiceRole.Arn
+        FieldLogLevel: "ERROR"
+
+  AppSyncActivitySchema:
+    Type: "AWS::AppSync::GraphQLSchema"
+    Properties:
+      ApiId: !Ref ReleasesGraphQLApi
+      DefinitionS3Location: ../../graphql/schema.graphql
+
+  ReleasesGraphQLAPILambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt ReleasesGraphQLApi.ApiId
+      Name: "ReleasesGraphQLAPILambdaDataSource"
+      Description: "GraphQL API Lambda data source"
+      Type: "AWS_LAMBDA"
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt ReleasesGraphQLAPIFunction.Arn
+
+  ReleasesGraphQLApiRequestCount:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReleasesAppSyncLogs
+      FilterPattern: '{ $.logType = "RequestSummary" }'
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: "Releases/ReleasesGraphQLApi"
+          MetricName: "AppSyncRequests"
+
+  ReleasesGraphQLApi2xxCount:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReleasesAppSyncLogs
+      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 2* }'
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: "Releases/ReleasesGraphQLApi"
+          MetricName: "AppSync2xx"
+
+  ReleasesGraphQLApi4xxCount:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReleasesAppSyncLogs
+      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 4* }'
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: "Releases/ReleasesGraphQLApi"
+          MetricName: "AppSync4xx"
+
+  ReleasesGraphQLApi5xxCount:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReleasesAppSyncLogs
+      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 5* }'
+      MetricTransformations:
+        - MetricValue: "1"
+          MetricNamespace: "Releases/ReleasesGraphQLApi"
+          MetricName: "AppSync5xx"
+
+  ApiAvailability:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      ActionsEnabled: true
+      AlarmDescription: !Sub 'AppSync ReleasesGraphQLApi-${Stage}-${Branch} availability is lower than 99%'
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: ReleasesGraphQLAPIId
+          Value: !Sub "${ReleasesGraphQLApi.ApiId}"
+      EvaluationPeriods: 5
+      MetricName: 5XXErrors
+      Namespace: AWS/ApiGateway
+      Period: 60
+      Statistic: Average
+      Threshold: 0.01
+      TreatMissingData: notBreaching
+
+  AppSyncDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub "Releases-Dashboard-${Stage}-${Branch}"
+      DashboardBody: !Sub >
+        {
+            "widgets": [
+                {
+                    "type": "text",
+                    "x": 0,
+                    "y": 0,
+                    "width": 24,
+                    "height": 1,
+                    "properties": {
+                        "markdown": "\n# AppSync ${AppName}\n"
+                    }
+                },
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 1,
+                    "width": 24,
+                    "height": 9,
+                    "properties": {
+                        "metrics": [
+                            [ { "expression": "(m2/m1)*100", "label": "percentage", "id": "e1", "yAxis": "right" } ],
+                            [ "AWS/AppSync", "5XXError", "ReleasesGraphQLAPIId", "${ReleasesGraphQLApi.ApiId}", { "label": "5xx errors", "id": "m2" } ],
+                            [ "...", { "stat": "SampleCount", "label": "total requests", "id": "m1" } ]
+                        ],
+                        "region": "${AWS::Region}",
+                        "title": "AppSync - 500 Errors vs Total Requests and SLA %",
+                        "stat": "Sum",
+                        "yAxis": {
+                            "left": {
+                                "label": "Count",
+                                "showUnits": false
+                            },
+                            "right": {
+                                "min": 0,
+                                "max": 10,
+                                "label": "Percentage Errors"
+                            }
+                        },
+                        "view": "timeSeries",
+                        "stacked": false,
+                        "annotations": {
+                            "horizontal": [
+                                {
+                                    "label": "% Availability SLA Threshold",
+                                    "value": 1,
+                                    "yAxis": "right"
+                                }
+                            ]
+                        },
+                        "period": 3600
+                    }
+                },
+                {
+                    "type": "metric",
+                    "x": 0,
+                    "y": 10,
+                    "width": 24,
+                    "height": 9,
+                    "properties": {
+                        "metrics": [
+                            [ "AWS/AppSync", "Latency", "ReleasesGraphQLAPIId", "${ReleasesGraphQLApi.ApiId}", { "stat": "p90", "period": 60 } ]
+                        ],
+                        "region": "${AWS::Region}",
+                        "title": "AppSync - Latency P90",
+                        "stat": "Sum",
+                        "yAxis": {
+                            "left": {
+                                "label": "Count",
+                                "showUnits": false
+                            }
+                        },
+                        "view": "timeSeries",
+                        "stacked": false,
+                        "period": 3600
+                    }
+                }
+            ]
+        }
+
+  AppSyncDashboardName:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: !Sub "/config/${AppName}/${Stage}/${Branch}/cloudwatch/DashboardName"
+      Type: "String"
+      Value: !Ref AppSyncDashboard
+      Description: "AppSync Dashboard name"
+
+  AppSyncURLParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/config/${AppName}/${Stage}/${Branch}/appsync_url"
+      Type: String
+      Value: !GetAtt ReleasesGraphQLApi.GraphQLUrl
