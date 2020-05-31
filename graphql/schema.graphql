@@ -28,12 +28,12 @@ type ReleasePage {
 }
 
 type Mutation {
-  createRelease(input: CreateReleaseInput!): Release
+  releaseCreate(input: CreateReleaseInput!): Release
 }
 
 type Query {
-  findRelease(id: ID!): Release
-  findReleases(nextToken: String): ReleasePage
+  release(id: ID!): Release
+  releaseList(nextToken: String, limit: Int): ReleasePage
 }
 
 type Subscription {

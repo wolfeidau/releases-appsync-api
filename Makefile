@@ -1,23 +1,15 @@
 STAGE ?= dev
 BRANCH ?= master
-APP_NAME ?= realworld-appsync-api
-PACKAGE ?= $(shell go mod edit -json | jq -r .Module.Path)
+APP_NAME ?= release-appsync-api
+
 GIT_HASH ?= $(shell git rev-parse --short HEAD)
+BUILD_DATE := $(shell date -u '+%Y-%m-%dT%H:%M:%SZ')
+
 RAW_EVENT_LOGGING ?= false
 
 GOLANGCI_VERSION = 1.27.0
 
-# https://tip.golang.org/cmd/go/#hdr-Module_configuration_for_non_public_modules
-#
-# for all modules in the jumacloud org avoid the GOPROXY/GOSUM requests and go direct
-export GOPRIVATE=github.com/jumacloud
-
-BUILD_OVERRIDES = \
-	-X $(PACKAGE)/internal/app.Name=$(APP_NAME) \
-	-X $(PACKAGE)/internal/app.BuildDate=$(shell date -u '+%Y-%m-%dT%H:%M:%SZ') \
-	-X $(PACKAGE)/internal/app.Commit=$(GIT_HASH)
-
-LDFLAGS := -ldflags='-w -s $(BUILD_OVERRIDES)' -trimpath
+LDFLAGS := -ldflags='-w -s -X main.buildDate=$(BUILD_DATE) -X main.commit=$(GIT_HASH)' -trimpath
 
 default: build archive package deploy
 .PHONY: default
@@ -37,6 +29,9 @@ bin/mockgen:
 bin/gcov2lcov:
 	@env GOBIN=$$PWD/bin GO111MODULE=on go install github.com/jandelgado/gcov2lcov
 
+bin/gqlgen:
+	@env GOBIN=$$PWD/bin GO111MODULE=on go install github.com/99designs/gqlgen
+
 clean:
 	@echo "--- clean all the things"
 	@rm -rf dist
@@ -44,10 +39,10 @@ clean:
 
 generate:
 	@echo "--- generate all the things"
-	@go generate ./...
+	@bin/gqlgen
 .PHONY: generate
 
-lint: bin/golangci-lint generate
+lint: bin/golangci-lint
 	@echo "--- lint all the things"
 	@bin/golangci-lint run
 .PHONY: lint
@@ -60,17 +55,17 @@ test: bin/gcov2lcov
 
 build:
 	@echo "--- build all the things"
-	@go build $(LDFLAGS) -o dist/lambda-api ./cmd/lambda-api
+	@GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build $(LDFLAGS) -o dist/lambda-api ./cmd/lambda-api
 .PHONY: build
 
 archive:
 	@echo "--- build an archive"
-	@cd dist && zip -X -9 -r ./handler.zip ./service-security-events
+	@cd dist && zip -X -9 -r ./handler.zip ./lambda-api
 .PHONY: archive
 
 package:
 	@echo "--- package CFN assets"
-	@echo aws cloudformation package \
+	@aws cloudformation package \
 		--template-file sam/api/template.yaml \
 		--s3-bucket $(PACKAGE_BUCKET) \
 		--s3-prefix $(APP_NAME) \
@@ -79,10 +74,12 @@ package:
 
 deploy:
 	@echo "--- deploy $(APP_NAME)-$(STAGE)-$(BRANCH) stack to aws"
-	@echo aws cloudformation deploy \
+	@aws cloudformation deploy \
 		--template-file dist/packaged-api-template.yaml \
 		--capabilities CAPABILITY_NAMED_IAM CAPABILITY_AUTO_EXPAND \
 		--tags "environment=$(STAGE)" "branch=$(BRANCH)" "service=$(APP_NAME)" "owner=$(USER)" \
 		--stack-name $(APP_NAME)-$(STAGE)-$(BRANCH) \
-		--parameter-overrides AppName=$(APP_NAME) Stage=$(STAGE) Branch=$(BRANCH) RawEventLogging=$(RAW_EVENT_LOGGING)
+		--parameter-overrides AppName=$(APP_NAME) Stage=$(STAGE) \
+			Branch=$(BRANCH) RawEventLogging=$(RAW_EVENT_LOGGING) \
+			OpenIDConnectIssuer=$(OPENID_CONNECT_ISSUER) OpenIDConnectClientId=$(OPENID_CONNECT_CLIENTID)
 .PHONY: deploy

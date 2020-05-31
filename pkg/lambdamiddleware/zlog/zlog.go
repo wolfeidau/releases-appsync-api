@@ -29,7 +29,7 @@ func WithConfig(cfg Config) func(next lambda.Handler) lambda.Handler {
 	return func(next lambda.Handler) lambda.Handler {
 		return lambdaextras.HandlerFunc(func(ctx context.Context, payload []byte) ([]byte, error) {
 			lc, _ := lambdacontext.FromContext(ctx)
-			zl := zerolog.New(cfg.Output).Level(cfg.Level).With().
+			zl := zerolog.New(cfg.Output).Level(cfg.Level).With().Caller().
 				Fields(cfg.Fields).
 				Str("aws_request_id", lc.AwsRequestID).
 				Str("amzn_trace_id", os.Getenv("_X_AMZN_TRACE_ID")).

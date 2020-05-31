@@ -17,12 +17,19 @@ Parameters:
   RawEventLogging:
     Type: String
     Default: "false"
+  OpenIDConnectIssuer:
+    Description: The OIDC Issuer which is typically a dev-xxxxxx.oktapreview.com for an Okta dev account.
+    Type: String
+  OpenIDConnectClientId:
+    Description: The OIDC Client Identifier which is an alphanumeric value for an Okta SPA application (implicit flow).
+    Type: String
 
 Globals:
   Function:
     Runtime: go1.x
     Timeout: 30
-    MemorySize: 256
+    MemorySize: 1024
+    Tracing: Active
     Environment:
       Variables:
         APP_NAME: !Ref AppName
@@ -34,20 +41,20 @@ Resources:
 
   ReleaseTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+    # DeletionPolicy: Retain
+    # UpdateReplacePolicy: Retain
     Properties:
       SSESpecification:
         SSEEnabled: true
       AttributeDefinitions:
-        - AttributeName: pk
+        - AttributeName: id
           AttributeType: S
-        - AttributeName: sk
+        - AttributeName: name
           AttributeType: S
       KeySchema:
-        - AttributeName: pk
+        - AttributeName: id
           KeyType: HASH
-        - AttributeName: sk
+        - AttributeName: name
           KeyType: RANGE
       TimeToLiveSpecification:
         AttributeName: expiry
@@ -63,7 +70,7 @@ Resources:
       Handler: lambda-api
       Environment:
         Variables:
-          - RELEASE_TABLE: !Ref ReleaseTable
+          RELEASE_TABLE: !Ref ReleaseTable
       Policies:
         - Version: '2012-10-17'
           Statement:
@@ -90,20 +97,34 @@ Resources:
                 - "appsync.amazonaws.com"
             Action:
               - "sts:AssumeRole"
-          - Effect: "Allow"
-            Action:
-              - "lambda:*"
-            Resource:
-              - "*"
       Path: "/"
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSAppSyncPushToCloudWatchLogs
+
+  AppSyncLambdaInvokePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "Releases-${Stage}-${Branch}-AppSyncLambdaInvokePolicy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:*
+            Resource:
+              - "*"
+      Roles:
+        - !Ref AppSyncServiceRole
 
   ReleasesGraphQLApi:
     Type: AWS::AppSync::GraphQLApi
     Properties:
       Name: !Sub "ReleasesGraphQLApi-${Stage}-${Branch}"
-      AuthenticationType: AWS_IAM
+      AuthenticationType: OPENID_CONNECT
+      OpenIDConnectConfig:
+        ClientId: !Ref OpenIDConnectClientId
+        Issuer: !Ref OpenIDConnectIssuer
+      XrayEnabled: true
       LogConfig:
         CloudWatchLogsRoleArn: !GetAtt AppSyncServiceRole.Arn
         FieldLogLevel: "ERROR"
@@ -111,7 +132,7 @@ Resources:
   AppSyncActivitySchema:
     Type: "AWS::AppSync::GraphQLSchema"
     Properties:
-      ApiId: !Ref ReleasesGraphQLApi
+      ApiId: !GetAtt ReleasesGraphQLApi.ApiId
       DefinitionS3Location: ../../graphql/schema.graphql
 
   ReleasesGraphQLAPILambdaDataSource:
@@ -125,45 +146,77 @@ Resources:
       LambdaConfig:
         LambdaFunctionArn: !GetAtt ReleasesGraphQLAPIFunction.Arn
 
-  ReleasesGraphQLApiRequestCount:
-    Type: AWS::Logs::MetricFilter
+  ReleaseCreateQueryResolver:
+    Type: AWS::AppSync::Resolver
     Properties:
-      LogGroupName: !Ref ReleasesAppSyncLogs
-      FilterPattern: '{ $.logType = "RequestSummary" }'
-      MetricTransformations:
-        - MetricValue: "1"
-          MetricNamespace: "Releases/ReleasesGraphQLApi"
-          MetricName: "AppSyncRequests"
+      ApiId: !GetAtt ReleasesGraphQLApi.ApiId
+      TypeName: Mutation
+      FieldName: releaseCreate
+      DataSourceName: !GetAtt "ReleasesGraphQLAPILambdaDataSource.Name"
+      RequestMappingTemplate: |
+        {
+            "version": "2018-05-29",
+            "operation": "Invoke",
+            "payload": {
+                "typeName": "$ctx.info.parentTypeName",
+                "field": "$ctx.info.fieldName",
+                "identity": $utils.toJson($ctx.identity),
+                "arguments":  $utils.toJson($context.arguments)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+          $util.error($context.error.message, $context.error.type)
+        #end
+        $util.toJson($context.result)
 
-  ReleasesGraphQLApi2xxCount:
-    Type: AWS::Logs::MetricFilter
+  ReleaseQueryResolver:
+    Type: AWS::AppSync::Resolver
     Properties:
-      LogGroupName: !Ref ReleasesAppSyncLogs
-      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 2* }'
-      MetricTransformations:
-        - MetricValue: "1"
-          MetricNamespace: "Releases/ReleasesGraphQLApi"
-          MetricName: "AppSync2xx"
+      ApiId: !GetAtt ReleasesGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: release
+      DataSourceName: !GetAtt "ReleasesGraphQLAPILambdaDataSource.Name"
+      RequestMappingTemplate: |
+        {
+            "version": "2018-05-29",
+            "operation": "Invoke",
+            "payload": {
+                "typeName": "$ctx.info.parentTypeName",
+                "field": "$ctx.info.fieldName",
+                "identity": $utils.toJson($ctx.identity),
+                "arguments":  $utils.toJson($context.arguments)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+          $util.error($context.error.message, $context.error.type)
+        #end
+        $util.toJson($context.result)
 
-  ReleasesGraphQLApi4xxCount:
-    Type: AWS::Logs::MetricFilter
+  ReleaseListQueryResolver:
+    Type: AWS::AppSync::Resolver
     Properties:
-      LogGroupName: !Ref ReleasesAppSyncLogs
-      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 4* }'
-      MetricTransformations:
-        - MetricValue: "1"
-          MetricNamespace: "Releases/ReleasesGraphQLApi"
-          MetricName: "AppSync4xx"
-
-  ReleasesGraphQLApi5xxCount:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: !Ref ReleasesAppSyncLogs
-      FilterPattern: '{ $.logType = "RequestSummary" && $.statusCode = 5* }'
-      MetricTransformations:
-        - MetricValue: "1"
-          MetricNamespace: "Releases/ReleasesGraphQLApi"
-          MetricName: "AppSync5xx"
+      ApiId: !GetAtt ReleasesGraphQLApi.ApiId
+      TypeName: Query
+      FieldName: releaseList
+      DataSourceName: !GetAtt "ReleasesGraphQLAPILambdaDataSource.Name"
+      RequestMappingTemplate: |
+        {
+            "version": "2018-05-29",
+            "operation": "Invoke",
+            "payload": {
+                "typeName": "$ctx.info.parentTypeName",
+                "field": "$ctx.info.fieldName",
+                "identity": $utils.toJson($ctx.identity),
+                "arguments":  $utils.toJson($context.arguments)
+            }
+        }
+      ResponseMappingTemplate: |
+        #if($ctx.error)
+          $util.error($context.error.message, $context.error.type)
+        #end
+        $util.toJson($context.result)
 
   ApiAvailability:
     Type: 'AWS::CloudWatch::Alarm'
@@ -185,7 +238,7 @@ Resources:
   AppSyncDashboard:
     Type: 'AWS::CloudWatch::Dashboard'
     Properties:
-      DashboardName: !Sub "Releases-Dashboard-${Stage}-${Branch}"
+      DashboardName: !Sub "Releases-Dashboard-${Stage}-${Branch}-${AWS::Region}"
       DashboardBody: !Sub >
         {
             "widgets": [
@@ -280,3 +333,9 @@ Resources:
       Name: !Sub "/config/${AppName}/${Stage}/${Branch}/appsync_url"
       Type: String
       Value: !GetAtt ReleasesGraphQLApi.GraphQLUrl
+
+Outputs:
+  AppSyncDashboardName:
+    Value: !Ref AppSyncDashboard
+  AppSyncURL:
+    Value: !GetAtt ReleasesGraphQLApi.GraphQLUrl
